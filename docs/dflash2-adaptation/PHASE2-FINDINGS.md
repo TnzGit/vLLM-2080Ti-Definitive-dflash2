@@ -98,3 +98,24 @@
 2. 若是：修调度侧 scheduled-tokens 语义或改增量式 context-KV 写入
    （sglang 侧同路径已验证为增量）；
 3. 解决后再上 128K 对标与 fast-mode 图折叠（对应 sglang 的 folded sampler 收益 +1.3%）。
+
+### 附录：fast 模式 Xid 31 实证（2026-08-24 深夜）
+
+dmesg（sudo dmesg -T | grep -i xid）：三次 fast 模式启动均在图捕获阶段触发
+双卡 Xid 31 MMU Fault（FAULT_PDE / ACCESS_TYPE_VIRT_READ，地址 0x0_00001000），
+对应 python 进程即 EngineCore worker。下游症状谱系：
+- 存活：输出恒为 token-0（'!'）/logprobs=NaN（argmax 于未定义 logits）
+- 死亡："RuntimeError: cancelled"（worker 静默死亡后引擎被取消，
+  launcher 报 START FAILED；无 Python traceback —— 硬件级非法读）
+
+结论：FULL 解码图 × DFLASH 调度（lookahead=K+1）在当前构建上存在
+显存越界读。normal 模式（PIECEWISE、全宽混合图重放）功能正确但每步
+505ms。两条路均不通 ⇒ 性能修复的前置是定位该越界读。
+
+下一步排查建议（按序）：
+1. 二分 num_speculative_tokens（7→3→1）确认是否 lookahead 宽度相关；
+2. 用 compute-sanitizer --tool memcheck 跑一次 capture 段（慢但直接给出
+   出错 kernel 名）；
+3. 对照 MTP3 臂（同 opt-in、同 FULL 图、无 DFlash2 层）确认基线健康；
+4. 检查私有池张量在 FULL 捕获时的可见性（capture 内 do_kv_cache_update
+   是否触达未绑定/已释放的草稿页视图）。

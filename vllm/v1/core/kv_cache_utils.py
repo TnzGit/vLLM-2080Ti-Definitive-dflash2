@@ -2129,7 +2129,7 @@ def _dflash_own_kv_pool_reserve_bytes(vllm_config: VllmConfig) -> int:
     page_bytes = 2 * block_size * kv_heads * head_dim * 2  # fp16 K+V
     # Headroom for lazy scratch the drafter's metadata builders may allocate
     # on their first propose (e.g. attention-backend workspaces).
-    scratch_reserve = 256 * 1024 * 1024
+    scratch_reserve = 128 * 1024 * 1024
     return num_layers * seqs * blocks_per_req * page_bytes + scratch_reserve
 
 

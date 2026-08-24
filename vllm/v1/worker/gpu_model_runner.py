@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import logging
 import threading
 import time
 from collections import defaultdict
@@ -4469,6 +4470,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            _fwd_t0 = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4476,6 +4478,25 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if logger.isEnabledFor(logging.DEBUG) or envs.VLLM_DFLASH_STEP_DEBUG:
+                torch.cuda.synchronize()
+                _num_input = input_ids.shape[0]
+                if True:
+                    _sd = scheduler_output
+                    _cached = getattr(_sd, "scheduled_cached_reqs", None)
+                    _computed = getattr(_cached, "num_computed_tokens", []) or []
+                    _r0 = _computed[0] if _computed else -1
+                    _spec_vals = list(_sd.scheduled_spec_decode_tokens.values())
+                    _spec0 = len(_spec_vals[0]) if _spec_vals else 0
+                    logger.info(
+                        "[TARGET-FWD] tokens=%d ms=%.1f computed0=%d "
+                        "spec_tok0=%d total_sched=%d",
+                        _num_input,
+                        (time.perf_counter() - _fwd_t0) * 1e3,
+                        _r0,
+                        _spec0,
+                        _sd.total_num_scheduled_tokens,
+                    )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

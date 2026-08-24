@@ -296,6 +296,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_DFLASH_OWN_KV_POOL: bool = True
+    VLLM_DFLASH_STEP_DEBUG: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -913,6 +914,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DFLASH_OWN_KV_POOL": lambda: bool(
         int(os.getenv("VLLM_DFLASH_OWN_KV_POOL", "1"))
+    ),
+    "VLLM_DFLASH_STEP_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_STEP_DEBUG", "0"))
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

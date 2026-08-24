@@ -9,6 +9,8 @@ per slot, scores transitions through the selector lattice, and walks the best
 chain from the verified anchor token.
 """
 
+import time
+
 import torch
 
 from vllm import envs
@@ -178,6 +180,32 @@ class DFlash2Proposer(DFlashProposer):
             new_cad.block_table_tensor = self._own_block_tables[:batch_size]
         return num_query_total, indices, new_cad
 
+    def propose(self, *args, **kwargs):
+        _dbg = envs.VLLM_DFLASH_STEP_DEBUG
+        total0 = time.perf_counter()
+        result = super().propose(*args, **kwargs)
+        if _dbg:
+            torch.cuda.synchronize()
+        total = time.perf_counter() - total0
+        if not _dbg:
+            return result
+        t = self._dbg_t
+        n = max(self._dbg_n, 1)
+        logger.info(
+            "[DFLASH2-STEP] n=%d inputs=%.1fms ctxkv=%.1fms sample=%.1fms "
+            "propose_total=%.1fms (avg over %d proposals)",
+            self._dbg_n,
+            t.get("inputs", 0.0) / n * 1e3,
+            t.get("ctxkv", 0.0) / n * 1e3,
+            t.get("sample", 0.0) / n * 1e3,
+            total * 1e3,
+            n,
+        )
+        # Reset accumulators so each log line reflects a fresh window.
+        self._dbg_t = {}
+        self._dbg_n = 0
+        return result
+
     def _sample_draft_tokens(
         self,
         hidden_states: torch.Tensor,
@@ -186,7 +214,13 @@ class DFlash2Proposer(DFlashProposer):
         # The walk replaces the per-slot logits sample entirely; a proposal
         # distribution is only produced by the V2 speculator's cache path.
         if sampling_metadata.all_greedy or not self._enable_probabilistic_draft_probs:
-            return self._greedy_sample(hidden_states), None
+            _t0 = time.perf_counter()
+            out = self._greedy_sample(hidden_states), None
+            torch.cuda.synchronize()
+            self._dbg_t["sample"] = (
+                self._dbg_t.get("sample", 0.0) + time.perf_counter() - _t0
+            )
+            return out
         raise NotImplementedError(
             "DFlash2 on the V1 model runner supports greedy drafting only."
         )

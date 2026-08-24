@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from dataclasses import replace
 from typing import Any
 
 import torch
 from typing_extensions import override
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -33,6 +35,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
     ):
         assert vllm_config.speculative_config is not None
         assert vllm_config.speculative_config.method == "dflash"
+        self._dbg_t: dict[str, float] = {}
+        self._dbg_n = 0
         draft_model_config = vllm_config.speculative_config.draft_model_config
         architectures = getattr(draft_model_config, "architectures", None) or []
         if type(self) is DFlashProposer and _DFLASH2_ARCHITECTURE in architectures:
@@ -124,6 +128,14 @@ class DFlashProposer(SpecDecodeBaseProposer):
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        _t0 = time.perf_counter() if envs.VLLM_DFLASH_STEP_DEBUG else 0.0
+        if _t0:
+            _sync_t0 = time.perf_counter()
+            torch.cuda.synchronize()
+            print(
+                f"[DFLASH-QUEUEDWAIT] entry_sync={((time.perf_counter()-_sync_t0)*1e3):.1f}ms",
+                flush=True,
+            )
         # DFlash cross-attention: context K/V from target hidden states,
         # Q from query embeddings (bonus + mask tokens).
         batch_size = cad.batch_size()
@@ -216,6 +228,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
             causal=self.dflash_causal,
         )
 
+        if _t0:
+            torch.cuda.synchronize()
+            self._dbg_t["inputs"] = (
+                self._dbg_t.get("inputs", 0.0) + time.perf_counter() - _t0
+            )
+            self._dbg_n += 1
         return num_query_total, token_indices_to_sample, new_cad
 
     @override
@@ -284,6 +302,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_input_tokens: int,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
     ) -> tuple[dict[str, Any], int]:
+        _t0 = time.perf_counter() if envs.VLLM_DFLASH_STEP_DEBUG else 0.0
         # Context and query positions/slots were written to separate
         # buffers by the kernel — no copy needed.
         num_context = self._dflash_num_context
@@ -294,6 +313,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self._context_positions_buffer[:num_context],
             self._context_slot_mapping_buffer[:num_context],
         )
+        if _t0:
+            torch.cuda.synchronize()
+            self._dbg_t["ctxkv"] = (
+                self._dbg_t.get("ctxkv", 0.0) + time.perf_counter() - _t0
+            )
         return (
             dict(
                 input_ids=self.input_ids[:num_input_tokens],
