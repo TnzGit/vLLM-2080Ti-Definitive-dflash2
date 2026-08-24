@@ -19,6 +19,10 @@ from vllm.v1.spec_decode.utils import (
 
 logger = init_logger(__name__)
 
+# The DFlash2 checkpoint architecture; resolved to DFlash2Proposer /
+# DFlash2Speculator by the runner dispatches.
+_DFLASH2_ARCHITECTURE = "DFlash2DraftModel"
+
 
 class DFlashProposer(SpecDecodeBaseProposer):
     def __init__(
@@ -29,6 +33,14 @@ class DFlashProposer(SpecDecodeBaseProposer):
     ):
         assert vllm_config.speculative_config is not None
         assert vllm_config.speculative_config.method == "dflash"
+        draft_model_config = vllm_config.speculative_config.draft_model_config
+        architectures = getattr(draft_model_config, "architectures", None) or []
+        if type(self) is DFlashProposer and _DFLASH2_ARCHITECTURE in architectures:
+            raise ValueError(
+                "A DFlash2DraftModel draft reached DFlashProposer, which has "
+                "no candidate selector: the drafter would silently degrade to "
+                "DFlash1. Route it through DFlash2Proposer."
+            )
         super().__init__(
             vllm_config=vllm_config,
             device=device,
