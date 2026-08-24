@@ -1,0 +1,62 @@
+# Phase 2 首轮上机结果（2026-08-24，216 隔离环境）
+
+> 环境：`/home/dual2080ti/.codex_tasks/LGP-001/vllm-2080ti-dflash2/repo`（本分支独立 clone，
+> `./build.sh` 全量源码构建成功：CUDA 13.0 / Torch 2.13 / GCC15 垫片 / FlashQLA SM75 扩展编译通过）。
+> 主机无法直连 GitHub（443 超时）——代码经 git bundle + scp 进场；PyPI 可达。
+
+## 已验证 ✅
+
+1. **构建链路**：build.sh 门禁全过；SM75 Marlin/GDN 内核编译成功；
+   `tools/dflash2_local_check.py` 在真机 venv 全绿。
+2. **注册与接缝**：DFlash2DraftModel→DFlash2Qwen3ForCausalLM 解析正常；
+   decoder_layer_cls/model_cls 缝生效。
+3. **MTP3 同码基线臂**：`orcarouter-mtp3-baseline-text-tqk8v4-32K.env`
+   在本分支完整启动（health 200，双卡各 ~20GB）。同码 A/B 的基线立住了。
+4. **DFlash2 启动推进到 KV 定价阶段**——后端选择（fp16 draft KV 修复后）、
+   权重加载、CUDA graph 估算全部通过。
+
+## 阻塞点 ❌：草稿 KV 组与 TQ 混合池的几何冲突
+
+现象演进（每次失败都前进一步）：
+
+| 尝试 | 结果 |
+|---|---|
+| 32K / util .95 | KV needed 4.71G > avail 0.48G |
+| +draft fp16 KV | 消除 "No valid attention backend"（triton 不接受继承的 k8v4 dtype）|
+| 8K / util .98 / batched 2048 | needed 3.83G > avail 2.01G（缺口收窄到 1.8G）|
+| 2K | 内存够了 → 新断言：`block_sizes=[2160×14, 16], hash_block_size=2160` |
+
+**根因（插桩实证）**：
+- 目标 TQ 组：block=2112~2160（随 max_model_len 变），page 1.563MiB ≈ **749 B/token/层**
+  （TurboQuant 压缩生效）；MTP 头并入该组零浪费 → 32K 下 needed 仅 0.415GiB/组。
+- DFlash2 草稿 5 层 SWA(fp16, kv_heads 4×hd128)自然页 = 32KB/block16
+  = **2KB/token/层**，被 `unify_kv_cache_spec_page_size` 强制 pad 到 **1.676MB/block**
+  （≈104KB/token/层，膨胀 51×）→ 草稿组单独贡献 2.24GiB "needed"@8K。
+- 且草稿 bs=16 与 TQ 组 bs=2160 无法整除统一 → coordinator 断言必炸
+  （与 prefix cache 开关无关；lcm 路径也救不了）。
+
+即：**多层的非 TQ 几何 drafter 无法进入当前中心混合 KV 池**。MTP 单头能过是它恰好
+与目标组同几何。
+
+## 修复方向（按优先级）
+
+1. **草稿池独立（推荐）**：DFlash proposer 本就维护自己的 block_tables /
+   kernel_block_sizes（fork 已有 manager-vs-kernel 双粒度机制）。把草稿 5 层从
+   engine-core 中央 spec 池摘出（类似 HiddenStateCacheSpec 的摘出模式，
+   kv_cache_utils.py:1823），由 proposer 按 32KB 小页自管分配。
+   改动集中在 kv_cache_utils 分组入口 + DFlashProposer 初始化。
+2. **几何对齐**：让草稿层按 TQ 组的 block 几何上报 spec（需要 TQ 后端支持
+   fp16 SWA 非因果页布局——大概率不可行）。
+3. **W8 草稿减重**（独立增益，可与 1 叠加）：lued-DFlash2-W8-draft 可把权重
+   从 3.85GB 降到 ~1.9GB，回收 ~1GB/卡 avail；需先解决 CT 打包加载（L1/L2 教训）。
+
+## 复现与诊断资产（主机 task 目录内）
+
+- `serve-dflash2{,b,c}.log`、`serve-specdbg{,2,3}.log`（含 GRPDBG/GRPDUMP 插桩输出）
+- `serve-mtp3.log` + run-logs（MTP3 臂成功记录）
+- 插桩补丁已还原；profile 变体（8K/2K/fp16-KV）已同步本地分支
+
+## 对标进度
+
+- 标杆：FP8+MTP3+K8V4 decode 92.09 tok/s（128K）。本轮在 32K 档先把同码 MTP3 臂
+  立起来作为公平对照；DFlash2 数字待阻塞点修复后测。
