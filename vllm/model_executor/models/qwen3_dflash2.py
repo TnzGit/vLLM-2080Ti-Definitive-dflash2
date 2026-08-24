@@ -272,9 +272,7 @@ def _lm_head_supports_topk(lm_head) -> bool:
     Both unquantized method classes run the same GEMM; a genuinely unsupported
     quantized head must fail with a message naming the method.
     """
-    from vllm.model_executor.layers.quantization.unquant import (
-        UnquantizedLinearMethod,
-    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
     )

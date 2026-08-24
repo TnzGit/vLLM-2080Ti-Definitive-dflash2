@@ -162,6 +162,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    KVCacheTensor,
     KVQuantMode,
     MambaSpec,
     SlidingWindowSpec,
@@ -193,7 +194,11 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
-from vllm.v1.spec_decode.dflash2 import DFlash2Proposer, is_dflash2_draft
+from vllm.v1.spec_decode.dflash2 import (
+    _DFLASH_KV_BLOCK_SIZE,
+    DFlash2Proposer,
+    is_dflash2_draft,
+)
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -7207,7 +7212,16 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
             )
-            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+            if isinstance(self.drafter, DFlash2Proposer) and (
+                self.drafter.wants_own_kv_pool()
+                and getattr(self.drafter, "model", None) is not None
+            ):
+                own_config, own_kernel_bs = self._build_dflash_own_kv_config()
+                self.drafter.initialize_attn_backend(own_config, [own_kernel_bs])
+            else:
+                self.drafter.initialize_attn_backend(
+                    kv_cache_config, kernel_block_sizes
+                )
 
     def _check_and_update_cudagraph_mode(
         self,
@@ -7730,6 +7744,106 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+        if (
+            self.speculative_config
+            and self._is_drafter_rank()
+            and isinstance(self.drafter, DFlash2Proposer)
+            and self.drafter.wants_own_kv_pool()
+            and getattr(self.drafter, "model", None) is not None
+        ):
+            self._init_dflash_own_kv_pool(is_profiling=is_profiling)
+
+    def _build_dflash_own_kv_config(
+        self, num_blocks: int | None = None
+    ) -> tuple[KVCacheConfig, int]:
+        """Central-config-shaped single group describing the DFlash2 pool."""
+        drafter = self.drafter
+        assert isinstance(drafter, DFlash2Proposer)
+        if num_blocks is None:
+            num_blocks = (
+                self.max_num_reqs
+                * drafter.own_kv_pool_blocks_per_req(self.max_model_len)
+            )
+        assert isinstance(drafter, DFlash2Proposer)
+        layer_names = drafter.own_kv_layer_names()
+        attn0 = drafter.model.model.layers[0].self_attn
+        spec = SlidingWindowSpec(
+            block_size=_DFLASH_KV_BLOCK_SIZE,
+            num_kv_heads=attn0.num_kv_heads,
+            head_size=attn0.head_dim,
+            dtype=self.dtype,
+            sliding_window=attn0.sliding_window,
+        )
+        page_bytes = spec.page_size_bytes
+        tensor = KVCacheTensor(size=page_bytes * num_blocks, shared_by=layer_names)
+        group = KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[tensor],
+            kv_cache_groups=[group],
+        ), _DFLASH_KV_BLOCK_SIZE
+
+    def _init_dflash_own_kv_pool(self, is_profiling: bool) -> None:
+        """Allocate and bind the DFlash2 drafter's private KV pool.
+
+        Sized for worst-case per-request regions (contiguous block rows), so
+        no runtime page allocator is needed: request r owns blocks
+        [r*bpr, (r+1)*bpr) and slot = row_base[r] + position.
+        """
+        drafter = self.drafter
+        assert isinstance(drafter, DFlash2Proposer)
+        max_model_len = self.max_model_len
+        num_spec_tokens = self.speculative_config.num_speculative_tokens
+        if is_profiling:
+            span = min(
+                max_model_len,
+                self.scheduler_config.max_num_batched_tokens + num_spec_tokens,
+            )
+            blocks_per_req = -(-span // _DFLASH_KV_BLOCK_SIZE)
+        else:
+            blocks_per_req = drafter.own_kv_pool_blocks_per_req(max_model_len)
+        config, kernel_block_size = self._build_dflash_own_kv_config(
+            self.max_num_reqs * blocks_per_req
+        )
+
+        attn_backend = (
+            drafter.model.model.layers[0].self_attn.attn.get_attn_backend()
+        )
+        raw_tensor = torch.zeros(
+            config.kv_cache_tensors[0].size, dtype=torch.int8, device=self.device
+        )
+        kv_cache_shape = attn_backend.get_kv_cache_shape(
+            config.num_blocks,
+            kernel_block_size,
+            config.kv_cache_groups[0].kv_cache_spec.num_kv_heads,
+            config.kv_cache_groups[0].kv_cache_spec.head_size,
+            cache_dtype_str="auto",
+        )
+        try:
+            stride_order = attn_backend.get_kv_cache_stride_order()
+            assert len(stride_order) == len(kv_cache_shape)
+        except (AttributeError, NotImplementedError):
+            stride_order = tuple(range(len(kv_cache_shape)))
+        kv_caches = {
+            name: _reshape_attention_kv_cache(
+                raw_tensor,
+                config.kv_cache_groups[0].kv_cache_spec,
+                kv_cache_shape,
+                stride_order,
+                config.num_blocks,
+                None,
+            )
+            for name in config.kv_cache_groups[0].layer_names
+        }
+        # bind_kv_cache asserts an empty runner list; the central pool is
+        # already bound by now, so bind the private pool directly.
+        for name, tensor in kv_caches.items():
+            self.kv_caches.append(tensor)
+            self.compilation_config.static_forward_context[name].bind_kv_cache(
+                tensor
+            )
+        drafter.enable_own_kv_pool(blocks_per_req)
+
     def _get_attention_kv_cache_gid(self) -> int:
         """Find the KV cache group index for attention layers.
 
@@ -7857,10 +7971,23 @@ class GPUModelRunner(
         """
         if has_ec_transfer() and not get_ec_transfer().is_consumer:
             return {}
+        own_pool_names: set[str] = set()
+        if (
+            self.speculative_config is not None
+            and self.drafter is not None
+            and isinstance(self.drafter, DFlash2Proposer)
+            and self.drafter.wants_own_kv_pool()
+        ):
+            # The DFlash2 drafter owns a private KV pool; its layers must be
+            # invisible to engine-core sizing/grouping (they would otherwise
+            # be page-padded against the target's TurboQuant geometry).
+            own_pool_names = set(self.drafter.own_kv_layer_names())
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
         for layer_name, attn_module in attn_layers.items():
+            if layer_name in own_pool_names:
+                continue
             if isinstance(attn_module, Attention) and (
                 kv_tgt_layer := attn_module.kv_sharing_target_layer_name
             ):

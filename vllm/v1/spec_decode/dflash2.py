@@ -11,10 +11,16 @@ chain from the verified anchor token.
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.dflash import _DFLASH2_ARCHITECTURE, DFlashProposer
 
 logger = init_logger(__name__)
+
+# Private-pool geometry: kernel blocks of 16 tokens, with a small tail so the
+# bonus/mask query slots always sit inside the request's region.
+_DFLASH_KV_BLOCK_SIZE = 16
+_DFLASH_KV_TAIL_TOKENS = 8
 
 
 def is_dflash2_draft(speculative_config) -> bool:
@@ -43,6 +49,134 @@ class DFlash2Proposer(DFlashProposer):
             )
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
+        # Private-pool state, populated by the runner when
+        # VLLM_DFLASH_OWN_KV_POOL is on: row r of _own_block_tables holds the
+        # kernel block ids of request r's contiguous region, so the slot of
+        # sequence position p is row_base[r] + p.
+        self.own_kv_pool = False
+        self._own_block_tables: torch.Tensor | None = None
+
+    def wants_own_kv_pool(self) -> bool:
+        # Only the V1 proposer implements the private pool today; a forced-V2
+        # run falls back to central pooling (which fails sizing loudly rather
+        # than silently mis-serving).
+        return envs.VLLM_DFLASH_OWN_KV_POOL and not (
+            self.vllm_config is not None
+            and getattr(self.vllm_config, "use_v2_model_runner", False)
+        )
+
+    def own_kv_layer_names(self) -> list[str]:
+        if getattr(self, "model", None) is None:
+            return []
+        return [
+            layer.self_attn.attn.layer_name
+            for layer in self.model.model.layers
+        ]
+
+    def own_kv_pool_blocks_per_req(self, max_model_len: int) -> int:
+        span = max_model_len + self.num_speculative_tokens + _DFLASH_KV_TAIL_TOKENS
+        return -(-span // _DFLASH_KV_BLOCK_SIZE)
+
+    def enable_own_kv_pool(
+        self,
+        num_blocks_per_req: int,
+        dtype: torch.dtype = torch.int32,
+    ) -> None:
+        """Arm the private pool: constant per-request page tables and bases."""
+        max_reqs = self.max_batch_size
+        device = self.device
+        self._own_block_tables = (
+            torch.arange(num_blocks_per_req, dtype=dtype, device=device)
+            .unsqueeze(0)
+            .repeat(max_reqs, 1)
+            + torch.arange(max_reqs, dtype=dtype, device=device).unsqueeze(1)
+            * num_blocks_per_req
+        )
+        self._own_row_base = (
+            torch.arange(max_reqs, dtype=torch.int64, device=device)
+            * num_blocks_per_req
+            * _DFLASH_KV_BLOCK_SIZE
+        )
+        self.own_kv_pool = True
+        logger.info(
+            "DFlash2 private KV pool armed: %d reqs x %d blocks x %d tokens",
+            max_reqs,
+            num_blocks_per_req,
+            _DFLASH_KV_BLOCK_SIZE,
+        )
+
+    def _rewrite_slots_for_own_pool(
+        self,
+        batch_size: int,
+        num_context: int,
+        target_query_start_loc: torch.Tensor,
+    ) -> None:
+        """Overwrite shared slot buffers with private-pool linear slots.
+
+        The base kernel filled the context/query slot buffers with central-pool
+        slots derived from the target block tables. With the private pool the
+        slot of position p in request r is simply row_base[r] + p, so rewrite
+        both buffers in place — every downstream consumer (context KV insert,
+        attention metadata, graph-replayed buffers) reads the same storage.
+        """
+        assert self._own_block_tables is not None
+        device = self._own_block_tables.device
+        ctx_buf = self._context_slot_mapping_buffer
+        query_buf = self._slot_mapping_buffer
+        num_query = batch_size * (1 + self.num_speculative_tokens)
+
+        req_ids = torch.arange(batch_size, device=device)
+
+        t_start = target_query_start_loc[: batch_size + 1].to(torch.int64)
+        if num_context > 0:
+            ctx_idx = torch.arange(num_context, device=device)
+            ctx_req = torch.searchsorted(t_start[1:].contiguous(), ctx_idx, right=True)
+            ctx_req = ctx_req.clamp(max=batch_size - 1)
+            safe_pos = torch.clamp(
+                self._context_positions_buffer[:num_context].to(torch.int64), min=0
+            )
+            ctx_buf[:num_context] = (self._own_row_base[ctx_req] + safe_pos).to(
+                ctx_buf.dtype
+            )
+
+        # Draft queries are request-major with exactly (1 + K) rows per
+        # request regardless of how many target tokens were scheduled.
+        per_req_queries = 1 + self.num_speculative_tokens
+        query_req = req_ids.repeat_interleave(per_req_queries)
+        query_pos = self.positions[:num_query].to(torch.int64)
+        clamped = torch.clamp(query_pos, max=self.max_model_len - 1)
+        query_buf[:num_query] = (self._own_row_base[query_req] + clamped).to(
+            query_buf.dtype
+        )
+
+    def set_inputs_first_pass(
+        self,
+        target_token_ids: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor | None,
+        cad,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
+    ):
+        target_qsl = cad.query_start_loc
+        batch_size = cad.batch_size()
+        num_query_total, indices, new_cad = super().set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=cad,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        )
+        if self.own_kv_pool:
+            self._rewrite_slots_for_own_pool(
+                batch_size, self._dflash_num_context, target_qsl
+            )
+            assert self._own_block_tables is not None
+            new_cad.block_table_tensor = self._own_block_tables[:batch_size]
+        return num_query_total, indices, new_cad
 
     def _sample_draft_tokens(
         self,

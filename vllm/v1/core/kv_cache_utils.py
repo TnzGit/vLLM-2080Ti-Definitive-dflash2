@@ -2094,6 +2094,45 @@ def _project_kv_cache_groups_to_worker(
 _TQ_CONTINUATION_DECODE_THRESHOLD = 128
 
 
+def _dflash_own_kv_pool_reserve_bytes(vllm_config: VllmConfig) -> int:
+    """Reserve the DFlash2 drafter's private KV pool before central sizing.
+
+    With VLLM_DFLASH_OWN_KV_POOL=1 the drafting layers are excluded from the
+    engine-core KV specs and the proposer allocates a contiguous per-request
+    region pool instead; this reservation keeps profiling honest about that
+    memory.
+    """
+    if not envs.VLLM_DFLASH_OWN_KV_POOL:
+        return 0
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or spec_config.method != "dflash":
+        return 0
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    if draft_model_config is None:
+        return 0
+    architectures = list(getattr(draft_model_config, "architectures", None) or [])
+    if "DFlash2DraftModel" not in architectures:
+        return 0
+    hf_config = draft_model_config.hf_config
+    num_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
+    total_kv_heads = int(getattr(hf_config, "num_key_value_heads", 0) or 0)
+    head_dim = int(getattr(hf_config, "head_dim", 0) or 0)
+    if not (num_layers and total_kv_heads and head_dim):
+        return 0
+    tp_size = max(1, vllm_config.parallel_config.tensor_parallel_size)
+    kv_heads = max(1, total_kv_heads // tp_size)
+    num_spec_tokens = int(spec_config.num_speculative_tokens or 0)
+    block_size = 16
+    seqs = int(vllm_config.scheduler_config.max_num_seqs)
+    max_len = int(vllm_config.model_config.max_model_len)
+    blocks_per_req = (-(- (max_len + num_spec_tokens + 2) // block_size))
+    page_bytes = 2 * block_size * kv_heads * head_dim * 2  # fp16 K+V
+    # Headroom for lazy scratch the drafter's metadata builders may allocate
+    # on their first propose (e.g. attention-backend workspaces).
+    scratch_reserve = 256 * 1024 * 1024
+    return num_layers * seqs * blocks_per_req * page_bytes + scratch_reserve
+
+
 def _turboquant_prefill_workspace_reserve_bytes(vllm_config: VllmConfig) -> int:
     """Reserve the TurboQuant continuation-prefill dequant workspace."""
     if not envs.VLLM_TQ_RESERVE_PREFILL_WORKSPACE:
@@ -2186,6 +2225,18 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+
+    dflash_reserve = _dflash_own_kv_pool_reserve_bytes(vllm_config)
+    if dflash_reserve > 0:
+        available_memory = [
+            avail_mem if not groups else max(0, avail_mem - dflash_reserve)
+            for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+        ]
+        logger.info(
+            "Reserving %.2f GiB per rank for the DFlash2 draft KV pool "
+            "(VLLM_DFLASH_OWN_KV_POOL=1).",
+            dflash_reserve / 2**30,
+        )
 
     workspace_reserve = _turboquant_prefill_workspace_reserve_bytes(vllm_config)
     if workspace_reserve > 0:

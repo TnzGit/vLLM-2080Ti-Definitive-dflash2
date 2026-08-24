@@ -60,8 +60,12 @@ def extract_function(path: Path, func_name: str) -> types.FunctionType:
 
 def install_stubs() -> None:
     """Minimal sys.modules stubs so dflash.py/dflash2.py import standalone."""
-    for name in ("vllm", "vllm.v1", "vllm.v1.spec_decode", "vllm.logger"):
+    for name in ("vllm", "vllm.v1", "vllm.v1.spec_decode", "vllm.logger",
+                 "vllm.envs"):
         sys.modules.setdefault(name, types.ModuleType(name))
+    envs_mod = sys.modules["vllm.envs"]
+    if not hasattr(envs_mod, "VLLM_DFLASH_OWN_KV_POOL"):
+        envs_mod.VLLM_DFLASH_OWN_KV_POOL = True
     logger_mod = sys.modules["vllm.logger"]
     if not hasattr(logger_mod, "init_logger"):
         logger_mod.init_logger = lambda *a, **k: logging.getLogger("stub")

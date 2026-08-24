@@ -499,6 +499,18 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def wants_own_kv_pool(self) -> bool:
+        """Whether this drafter manages KV cache outside the central pool."""
+        return False
+
+    def own_kv_layer_names(self) -> list[str]:
+        """Attention layer names owned by the drafter's private pool."""
+        return []
+
+    def own_kv_pool_blocks_per_req(self, max_model_len: int) -> int:
+        """Kernel-block rows reserved per request in the private pool."""
+        raise NotImplementedError
+
     def propose(
         self,
         num_speculative_tokens,
