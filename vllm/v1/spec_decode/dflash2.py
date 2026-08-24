@@ -44,6 +44,19 @@ class DFlash2Proposer(DFlashProposer):
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
 
+    def _sample_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata,
+    ) -> tuple[torch.Tensor, None]:
+        # The walk replaces the per-slot logits sample entirely; a proposal
+        # distribution is only produced by the V2 speculator's cache path.
+        if sampling_metadata.all_greedy or not self._enable_probabilistic_draft_probs:
+            return self._greedy_sample(hidden_states), None
+        raise NotImplementedError(
+            "DFlash2 on the V1 model runner supports greedy drafting only."
+        )
+
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_rows = hidden_states.shape[0]
         num_steps = self.num_speculative_tokens
