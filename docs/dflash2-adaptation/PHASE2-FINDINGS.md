@@ -60,3 +60,41 @@
 
 - 标杆：FP8+MTP3+K8V4 decode 92.09 tok/s（128K）。本轮在 32K 档先把同码 MTP3 臂
   立起来作为公平对照；DFlash2 数字待阻塞点修复后测。
+
+---
+
+## Phase 2 第二轮（私有池实现后，2026-08-24 深夜）
+
+### 已达成 ✅
+
+1. **方向 1 落地并跑通**：`VLLM_DFLASH_OWN_KV_POOL=1`（默认开）下，
+   草稿层从中央 spec 池剔除、proposer 自管连续区域池（线性槽位）、
+   engine 侧等额预留——**DFlash2 首次在本 fork 上完整服务**。
+2. **同码基线复现标杆**：MTP3 臂（32K/normal/K8V4/util .98）3×4096/128 贪心
+   **decode 91.81 tok/s**（用户标杆 92.09，偏差 0.3%）；prefill 1152.9；
+   TTFT 3.66s。基准方法学与分支正确性同时得到验证。
+3. **DFlash2 32K 臂输出连贯**：与基线逐字一致的前缀（"Paris.\nThe capital
+   of Germany is Berlin..."），贪心 verify 路径数值正确。
+
+### 新阻塞 ❌：DFlash2 每步 ~5–10s 的病态开销
+
+- 现象：mt=8 → 10.8s；mt=64 → 88.4s；bench decode 0.72 tok/s。
+  与上下文长度基本无关（5-token prompt 同样慢），两种草稿后端
+  （TRITON_ATTN / FLASHINFER）一致。
+- 排除项：非 FULL-graph NaN 问题（normal/PIECEWISE 下同样慢但输出正确）；
+  非草稿后端选择；非预留/池尺寸。
+- py-spy 采样（88 样本）：gdn/causal_conv 相关 43%、turboquant_store 24%、
+  propose/draft 16%——大量时间落在目标前向的 GDN conv/store 内核，
+  怀疑 DFLASH lookahead 调度使每步 `num_scheduled_tokens` 或
+  `precompute_and_store_context_kv` 的写入范围退化为全上下文量级
+  （待下轮用 num_target_tokens 日志证实）。
+- 另记录：FULL 解码图 × DFlash2 = 目标 logits NaN（argmax 落 token-0 '!'），
+  PIECEWISE 无此问题；fast 模式的 `VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH`
+  开关不是根因。
+
+### 下一工作项
+
+1. 在 `propose()` 打点 `num_target_tokens` / `num_context`，确认是否全量重写；
+2. 若是：修调度侧 scheduled-tokens 语义或改增量式 context-KV 写入
+   （sglang 侧同路径已验证为增量）；
+3. 解决后再上 128K 对标与 fast-mode 图折叠（对应 sglang 的 folded sampler 收益 +1.3%）。

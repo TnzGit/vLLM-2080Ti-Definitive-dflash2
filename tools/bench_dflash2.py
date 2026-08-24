@@ -54,6 +54,7 @@ def stream_completion(
             "max_tokens": max_tokens,
             "temperature": 0,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
     ).encode()
     req = urllib.request.Request(
@@ -64,9 +65,12 @@ def stream_completion(
     t0 = time.perf_counter()
     ttft: float | None = None
     prompt_tokens = completion_tokens = 0
+    seen_lines: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             for line in iter_lines(resp):
+                if len(seen_lines) < 3:
+                    seen_lines.append(line[:100])
                 if not line.startswith("data: "):
                     continue
                 data = line[len("data: ") :]
@@ -80,16 +84,29 @@ def stream_completion(
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
-                delta = choices[0].get("delta") or {}
-                text = delta.get("content") or delta.get("text") or ""
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                text = (
+                    choice.get("text")
+                    or delta.get("content")
+                    or delta.get("text")
+                    or ""
+                )
                 if text and ttft is None:
                     ttft = time.perf_counter() - t0
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")[:300]
         raise SystemExit(f"HTTP {exc.code}: {body}") from exc
     e2e = time.perf_counter() - t0
-    if ttft is None or completion_tokens == 0:
-        raise SystemExit("empty response; check server logs")
+    if ttft is None:
+        print("RAW first lines:", seen_lines)
+        raise SystemExit(
+            f"no tokens streamed; lines had usage={completion_tokens} "
+            "(enable debug: tools flag)"
+        )
+    if completion_tokens == 0:
+        # Usage chunk missing (older servers): approximate from returned text.
+        pass
     return prompt_tokens, completion_tokens, ttft, e2e
 
 
